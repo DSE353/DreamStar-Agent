@@ -1,82 +1,98 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-星璇 AI Agent - 安全框架（二级危险拦截 + 免责声明）
-完全体：模型加载 + ReAct 工具调用 + 强网络搜索（文本/新闻/图片/网页抓取）
+星璇 AI Agent - 安全增强版（二级危险拦截 + 免责声明）
+完整功能：模型加载(GGUF)、ReAct工具调用、浏览器自动化(Playwright)、摄像头拍照、
+OCR识别、TTS语音合成、网络搜索、数据处理、定时任务、网页抓取、技能热加载、记忆系统。
 运行前安装依赖：
-    pip install flask flask-cors llama-cpp-python duckduckgo-search pandas openpyxl easyocr Pillow pyttsx3 requests beautifulsoup4 readability-lxml
+    pip install flask flask-cors llama-cpp-python duckduckgo-search pandas openpyxl easyocr Pillow pyttsx3 opencv-python apscheduler beautifulsoup4 requests playwright
+    playwright install chromium
 """
 
-import os
-import re
-import json
-import time
-import uuid
-import sqlite3
-import logging
-import subprocess
-import importlib.util
+import os, re, json, time, uuid, sqlite3, logging, subprocess, importlib.util, base64, io, threading
 from datetime import datetime
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Union
+from urllib.parse import quote_plus, unquote
 
-from flask import Flask, request, jsonify, render_template_string
+from flask import Flask, request, jsonify, render_template_string, send_from_directory
 from flask_cors import CORS
-from urllib.parse import unquote, urlparse
 
-# ========== 可选依赖安全导入 ==========
+# 可选依赖安全导入
 def safe_import(name):
     try:
         return importlib.import_module(name)
     except ImportError:
         return None
 
-# 网络请求与解析
-requests_lib = safe_import("requests")
-bs4 = safe_import("bs4")
-readability = safe_import("readability")
-ddgs = safe_import("duckduckgo_search")
-
-# 其他可选（数据处理、OCR、TTS等）
-pd = safe_import("pandas")
-easyocr = safe_import("easyocr")
-pyttsx3 = safe_import("pyttsx3")
+# 核心依赖
+import cv2
+from PIL import Image
+import requests as http_requests
+from bs4 import BeautifulSoup
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.interval import IntervalTrigger
+from apscheduler.jobstores.memory import MemoryJobStore
+from apscheduler.executors.pool import ThreadPoolExecutor
 
 # ========== 危险命令分级黑名单 ==========
 CRITICAL_PATTERNS = [
     r"rm\s+(-[rf]+)+\s*/", r"rm\s+(-[rf]+)+\s*/\*", r"rm\s+(-[rf]+)+\s*~",
-    r"dd\s+if=/dev/(zero|urandom|random)\s+of=/dev/sd[a-z]",
+    r"rm\s+(-[rf]+)+\s*\$HOME",
+    r"dd\s+if=/dev/(zero|urandom|random)\s+of=/dev/(sd[a-z]|hd[a-z]|nvme\d+n\d+)",
     r"mkfs\.\w+\s+/dev/", r"format\s+[c-z]:", r"del\s+/(f|q)/s\s+[c-z]:\\\\",
-    r"rd\s+/s/q\s+[c-z]:\\\\", r"chmod\s+-R\s+777\s+/", r"chown\s+-R\s+nobody:\s+/",
-    r"userdel\s+-r\s+root", r"iptables\s+-F", r"systemctl\s+mask",
-    r"reg\s+delete\s+HKLM\s+/f", r":\(\)\{\s*:\|:&\s*\};:", r"%0\|%0",
-    r"(wget|curl)\s+.*\s*\|\s*(sh|bash)", r"sudo\s+.*(rm|dd|mkfs)",
-    r"su\s+-c\s+[\"'].*(rm|dd|mkfs).*[\"']", r"/bin/(rm|dd|mkfs)",
-    r"['\"]rm['\"]\s+-rf\s+/", r"r\\m\s+-rf\s+/", r"Sudo\s+rm",
+    r"rd\s+/s/q\s+[c-z]:\\\\", r"mv\s+/\*\s+/dev/null",
+    r">\s*/dev/sd[a-z]", r"cat\s+/dev/zero\s*>\s*/dev/sd[a-z]",
+    r"chmod\s+-R\s+777\s+/", r"chmod\s+777\s+-R\s+/",
+    r"chmod\s+a=rwx\s+-R\s+/", r"chown\s+-R\s+nobody:\s+/",
+    r"userdel\s+-r\s+root", r"iptables\s+-F", r"systemctl\s+mask\s+\w+",
+    r"reg\s+delete\s+HKLM\s+/f", r"reg\s+delete\s+HKCU\s+/f",
+    r"netsh\s+advfirewall\s+set\s+allprofiles\s+state\s+off",
+    r"sudo\s+su\s*-", r"sudo\s+-s", r"echo\s+.*>>\s*/etc/sudoers",
+    r"chmod\s+\+s\s+/bin/bash", r"sudo\s+passwd\s+root",
+    r":\(\)\{\s*:\|:&\s*\};:", r"%0\|%0", r"%0\s*\|\s*%0",
+    r"(wget|curl)\s+.*\s*\|\s*(sh|bash)",
+    r"powershell.*Invoke-Expression.*DownloadString",
+    r"certutil\s+-urlcache\s+-f\s+http.*&.*",
+    r"sudo\s+.*(rm|dd|mkfs|format|del|rd)",
+    r"su\s+-c\s+[\"'].*(rm|dd|mkfs).*[\"']",
+    r"/bin/(rm|dd|mkfs)", r"/usr/bin/(rm|dd|mkfs)",
+    r"command\s+(rm|dd|mkfs)", r"['\"]rm['\"]\s+-rf\s+/",
+    r"r\\m\s+-rf\s+/", r"Sudo\s+rm",
+    r"\$\((rm|dd|mkfs).*\)", r"`(rm|dd|mkfs).*`",
+    r"rm\s+-rf\s+\*", r"rm\s+-rf\s+\.[/]*\*",
 ]
+
 WARNING_PATTERNS = [
-    r"rm\s+-rf\s+~/(Documents|Downloads|Desktop|Pictures)",
-    r"rm\s+-rf\s+~/\.\w+", r"systemctl\s+(stop|disable|kill)\s+\w+",
-    r"kill\s+-9\s+[1-9]\d*", r">\s*/var/log/\w+\.log",
+    r"rm\s+-rf\s+~/(Documents|Downloads|Desktop|Pictures|Music|Videos)",
+    r"rm\s+-rf\s+~/\.\w+", r"rm\s+-rf\s+/home/\w+/", r"rm\s+-rf\s+/Users/\w+/",
+    r"systemctl\s+(stop|disable|kill)\s+\w+",
+    r"launchctl\s+unload\s+/System/Library/LaunchDaemons/",
+    r"reg\s+delete\s+HKCU\\Software",
+    r"reg\s+add\s+HKLM\\Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+    r"kill\s+-9\s+[1-9]\d*",
+    r">\s*/var/log/\w+\.log", r"truncate\s+-s\s+0\s+/var/log/\w+\.log",
+    r"chmod\s+777\s+~", r"chown\s+-R\s+\w+:\w+\s+~",
 ]
 
 CRITICAL_REGEX = [re.compile(p, re.IGNORECASE) for p in CRITICAL_PATTERNS]
 WARNING_REGEX   = [re.compile(p, re.IGNORECASE) for p in WARNING_PATTERNS]
 
 def check_command_danger_level(cmd: str) -> int:
+    """0=安全, 1=警告, 2=严重"""
     try:
         decoded = unquote(cmd)
     except:
         decoded = cmd
-    cmd_clean = decoded.strip()
     for r in CRITICAL_REGEX:
-        if r.search(cmd_clean):
+        if r.search(decoded):
             return 2
     for r in WARNING_REGEX:
-        if r.search(cmd_clean):
+        if r.search(decoded):
             return 1
     return 0
 
-# ========== Flask 应用 ==========
+# ========== Flask 应用配置 ==========
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 app = Flask(__name__)
@@ -87,11 +103,13 @@ UPLOAD_FOLDER = "uploads"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 SKILLS_DIR = "skills"
 os.makedirs(SKILLS_DIR, exist_ok=True)
+TEMP_DIR = "temp"
+os.makedirs(TEMP_DIR, exist_ok=True)
 MEMORY_FILE = "memory.txt"
 DB_PATH = "memory_long.db"
 
 # 全局状态
-model: Any = None          # Llama 实例
+model: Any = None
 model_type: str = ""
 model_info: Dict = {}
 conversation_history: List[Dict] = []
@@ -99,11 +117,20 @@ current_config = {
     'model_path': '', 'temperature': 0.5, 'top_p': 0.9, 'top_k': 40,
     'repeat_penalty': 1.05, 'max_tokens': 256, 'enable_search': True
 }
-_pending_warning_command = None
-reader_easyocr = None
-tts_engine = None
+_pending_warning_command: Optional[Dict] = None
 
-# ---------- 长期记忆 ----------
+# 定时任务调度器
+scheduler = BackgroundScheduler(
+    jobstores={'default': MemoryJobStore()},
+    executors={'default': ThreadPoolExecutor(10)},
+    timezone='Asia/Shanghai'
+)
+scheduler.start()
+
+# 浏览器持久化上下文（可选，用于多步骤操作）
+browser_context = None
+
+# ========== 长期记忆 ==========
 def init_long_memory():
     conn = sqlite3.connect(DB_PATH)
     conn.execute('''CREATE TABLE IF NOT EXISTS memories
@@ -132,7 +159,7 @@ def clear_all_long_memory():
     conn.commit()
     conn.close()
 
-# ---------- 短期记忆 ----------
+# ========== 短期记忆 ==========
 def load_memory():
     if not os.path.exists(MEMORY_FILE): return []
     with open(MEMORY_FILE, 'r', encoding='utf-8') as f:
@@ -157,128 +184,208 @@ def update_memory_item(idx, new_text):
 def clear_all_memory():
     save_memory([])
 
-# ---------- 工具实现（命令执行、数据处理、OCR、TTS、技能等）----------
+# ========== 工具实现 ==========
 def _execute_command_safe(cmd):
     try:
         res = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=20)
         out = res.stdout + res.stderr
-        return out[:2000] if out.strip() else "✅ 命令已执行"
+        return out[:2000] if out.strip() else "✅ 命令已执行成功"
+    except subprocess.TimeoutExpired:
+        return "⏰ 命令执行超时（20秒）"
     except Exception as e:
         return f"❌ 执行失败: {str(e)}"
 
 def run_command(cmd):
     level = check_command_danger_level(cmd)
     if level == 2:
-        return "⚠️ 严重危险命令已自动拦截（可能破坏系统）"
-    if level == 1:
+        logger.warning(f"拦截严重危险命令: {cmd}")
+        return "⚠️ **严重危险命令已自动拦截**\n\n该命令可能破坏系统，星璇已拒绝执行。"
+    elif level == 1:
         global _pending_warning_command
         _pending_warning_command = {"command": cmd, "pending_since": time.time()}
-        return (f"⚠️ 此操作可能影响系统稳定性或数据安全\n\n命令：`{cmd}`\n\n"
-                "**免责声明**：继续执行后果自负。\n请回复「同意执行」或「拒绝」")
+        return (
+            "⚠️ **此操作可能影响系统稳定性或数据安全**\n\n"
+            f"命令：`{cmd}`\n\n"
+            "**免责声明**：继续执行此操作可能造成系统异常、数据丢失等后果。\n"
+            "您明确知晓并自愿承担所有风险。\n\n"
+            "请选择：\n- 回复「**同意执行**」继续（后果自负）\n- 回复「**拒绝**」取消操作"
+        )
     return _execute_command_safe(cmd)
 
-# ---------- 全新网络搜索模块（文本/新闻/图片/抓取）----------
-def search_web(query: str, max_results: int = 5) -> str:
-    """文本搜索（DuckDuckGo）"""
-    if ddgs is None:
-        return "搜索功能不可用：请安装 duckduckgo-search"
+# --- 浏览器自动化（Playwright）---
+def _get_browser():
+    """获取或创建浏览器上下文（可复用）"""
+    global browser_context
     try:
-        from duckduckgo_search import DDGS
-        with DDGS() as ddgs_obj:
-            results = list(ddgs_obj.text(query, max_results=max_results))
-        if not results:
-            return f"未找到关于“{query}”的搜索结果"
-        formatted = []
-        for r in results:
-            title = r.get('title', '无标题')
-            href = r.get('href', '#')
-            body = r.get('body', '无摘要')
-            formatted.append(f"- **{title}**\n  链接：{href}\n  摘要：{body}\n")
-        return f"🔍 关于“{query}”的搜索结果：\n\n" + "\n".join(formatted)
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        return None
+    if browser_context is None:
+        playwright = sync_playwright().start()
+        browser = playwright.chromium.launch(headless=True)
+        browser_context = browser.new_context()
+    return browser_context
+
+def browser_navigate(url):
+    try:
+        ctx = _get_browser()
+        if not ctx:
+            return "请安装 playwright：pip install playwright && playwright install chromium"
+        page = ctx.new_page()
+        page.goto(url, timeout=15000)
+        title = page.title()
+        # 保存页面引用，方便后续操作
+        page.set_extra_http_headers({"User-Agent": "Mozilla/5.0"})
+        # 返回标题，后续可通过page_id获取
+        page_id = str(uuid.uuid4())
+        # 存储到全局字典中
+        if not hasattr(browser_navigate, 'pages'):
+            browser_navigate.pages = {}
+        browser_navigate.pages[page_id] = page
+        return f"已打开网页：{title}\n页面ID：{page_id}（可用于后续点击、填充）"
     except Exception as e:
-        logger.error(f"搜索失败: {e}")
+        return f"浏览器错误：{e}"
+
+def browser_click(selector, page_id=None):
+    try:
+        if page_id and hasattr(browser_navigate, 'pages'):
+            page = browser_navigate.pages.get(page_id)
+            if not page:
+                return "页面不存在或已关闭"
+            page.click(selector)
+            return f"已点击元素：{selector}"
+        else:
+            return "请提供有效的页面ID（来自 browser_navigate 返回的ID）"
+    except Exception as e:
+        return f"点击失败: {e}"
+
+def browser_fill(selector, text, page_id=None):
+    try:
+        if page_id and hasattr(browser_navigate, 'pages'):
+            page = browser_navigate.pages.get(page_id)
+            if not page:
+                return "页面不存在或已关闭"
+            page.fill(selector, text)
+            return f"已填充 {selector} 为 {text}"
+        else:
+            return "请提供有效的页面ID"
+    except Exception as e:
+        return f"填充失败: {e}"
+
+def browser_screenshot(page_id=None, path=None):
+    try:
+        if page_id and hasattr(browser_navigate, 'pages'):
+            page = browser_navigate.pages.get(page_id)
+            if not page:
+                return "页面不存在或已关闭"
+            if not path:
+                path = os.path.join(TEMP_DIR, f"screenshot_{uuid.uuid4().hex}.png")
+            page.screenshot(path=path, full_page=True)
+            return f"截图已保存至：{path}"
+        else:
+            return "请提供有效的页面ID"
+    except Exception as e:
+        return f"截图失败: {e}"
+
+# --- 摄像头拍照 ---
+def capture_camera(filename=None):
+    try:
+        cap = cv2.VideoCapture(0)
+        if not cap.isOpened():
+            return "无法打开摄像头"
+        ret, frame = cap.read()
+        cap.release()
+        if not ret:
+            return "拍照失败"
+        if not filename:
+            filename = os.path.join(TEMP_DIR, f"capture_{uuid.uuid4().hex}.jpg")
+        cv2.imwrite(filename, frame)
+        # 同时返回 base64 方便预览
+        _, buffer = cv2.imencode('.jpg', frame)
+        b64_str = base64.b64encode(buffer).decode('utf-8')
+        return f"拍照成功，保存至 {filename}\nBase64 预览：data:image/jpeg;base64,{b64_str[:50]}..."
+    except Exception as e:
+        return f"摄像头错误：{e}"
+
+# --- OCR 图片文字识别 ---
+def image_caption(path, lang='ch_sim+en'):
+    if not os.path.exists(path):
+        return f"图片不存在: {path}"
+    try:
+        reader = safe_import("easyocr")
+        if not reader:
+            return "请安装 easyocr"
+        # 创建 Reader（只初始化一次）
+        if not hasattr(image_caption, 'reader_cache'):
+            image_caption.reader_cache = {}
+        if lang not in image_caption.reader_cache:
+            image_caption.reader_cache[lang] = reader.Reader(lang.split('+'))
+        ocr_reader = image_caption.reader_cache[lang]
+        result = ocr_reader.readtext(path)
+        text = " ".join([item[1] for item in result])
+        return f"图片文字识别结果：{text if text else '(无文字)'}"
+    except Exception as e:
+        return f"OCR 错误：{e}"
+
+# --- TTS 语音合成 ---
+def text_to_speech(text, filename=None):
+    try:
+        pyttsx3 = safe_import("pyttsx3")
+        if not pyttsx3:
+            return "请安装 pyttsx3"
+        if not filename:
+            filename = os.path.join(TEMP_DIR, f"tts_{uuid.uuid4().hex}.mp3")
+        engine = pyttsx3.init()
+        engine.save_to_file(text, filename)
+        engine.runAndWait()
+        return f"语音已保存至 {filename}"
+    except Exception as e:
+        return f"TTS 错误：{e}"
+
+# --- 网络搜索 ---
+def search_web(query):
+    if not current_config.get('enable_search', True):
+        return "联网搜索已禁用"
+    try:
+        ddg = safe_import("duckduckgo_search")
+        if not ddg:
+            return "请安装 duckduckgo-search"
+        from duckduckgo_search import DDGS
+        with DDGS() as ddgs:
+            results = list(ddgs.text(query, max_results=5))
+        if not results:
+            return f"未找到“{query}”的相关结果"
+        formatted = "\n".join(f"- {r['title']}: {r['href']}" for r in results)
+        return f"搜索“{query}”结果：\n{formatted}"
+    except Exception as e:
         return f"搜索出错：{e}"
 
-def search_news(query: str, max_results: int = 5) -> str:
-    """新闻搜索"""
-    if ddgs is None:
-        return "新闻搜索不可用：请安装 duckduckgo-search"
+# --- 网页内容抓取 ---
+def scrape_web(url, selector=None):
     try:
-        from duckduckgo_search import DDGS
-        with DDGS() as ddgs_obj:
-            results = list(ddgs_obj.news(query, max_results=max_results))
-        if not results:
-            return f"未找到关于“{query}”的新闻"
-        formatted = []
-        for r in results:
-            title = r.get('title', '无标题')
-            href = r.get('url', '#')
-            date = r.get('date', '未知日期')
-            body = r.get('body', '无摘要')
-            formatted.append(f"- **{title}** ({date})\n  链接：{href}\n  摘要：{body}\n")
-        return f"📰 关于“{query}”的新闻：\n\n" + "\n".join(formatted)
-    except Exception as e:
-        logger.error(f"新闻搜索失败: {e}")
-        return f"新闻搜索出错：{e}"
-
-def search_images(query: str, max_results: int = 5) -> str:
-    """图片搜索（返回图片链接）"""
-    if ddgs is None:
-        return "图片搜索不可用：请安装 duckduckgo-search"
-    try:
-        from duckduckgo_search import DDGS
-        with DDGS() as ddgs_obj:
-            results = list(ddgs_obj.images(query, max_results=max_results))
-        if not results:
-            return f"未找到关于“{query}”的图片"
-        formatted = []
-        for r in results:
-            title = r.get('title', '无标题')
-            img_url = r.get('image', '#')
-            source = r.get('source', '未知来源')
-            formatted.append(f"- **{title}**\n  图片链接：{img_url}\n  来源：{source}\n")
-        return f"🖼️ 关于“{query}”的图片结果：\n\n" + "\n".join(formatted)
-    except Exception as e:
-        logger.error(f"图片搜索失败: {e}")
-        return f"图片搜索出错：{e}"
-
-def fetch_webpage(url: str) -> str:
-    """抓取指定网页的核心正文内容"""
-    if requests_lib is None or bs4 is None:
-        return "网页抓取不可用：请安装 requests 和 beautifulsoup4"
-    if not url.startswith(('http://', 'https://')):
-        url = 'https://' + url
-    try:
-        # 静态抓取
-        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
-        resp = requests_lib.get(url, timeout=15, headers=headers)
-        resp.raise_for_status()
-        # 尝试使用 readability 提取正文
-        if readability:
-            from readability import Document
-            doc = Document(resp.text)
-            content = doc.summary()
-            # 用 BeautifulSoup 提取纯文本
-            soup = bs4.BeautifulSoup(content, 'html.parser')
-            text = soup.get_text(separator='\n', strip=True)
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        resp = http_requests.get(url, headers=headers, timeout=10)
+        resp.encoding = resp.apparent_encoding
+        soup = BeautifulSoup(resp.text, 'html.parser')
+        if selector:
+            elements = soup.select(selector)
+            if not elements:
+                return f"未找到选择器 {selector} 匹配的元素"
+            texts = [el.get_text(strip=True) for el in elements[:10]]
+            return "提取内容：\n" + "\n---\n".join(texts)
         else:
-            # 普通提取：移除脚本和样式
-            soup = bs4.BeautifulSoup(resp.text, 'html.parser')
-            for script in soup(["script", "style"]):
-                script.decompose()
-            text = soup.get_text(separator='\n', strip=True)
-        # 限制长度
-        if len(text) > 3000:
-            text = text[:3000] + "...\n[内容过长，已截断]"
-        return f"📄 网页内容摘要（{url}）：\n\n{text}"
+            # 返回页面标题和所有文本
+            title = soup.title.string if soup.title else "无标题"
+            text = soup.get_text(" ", strip=True)[:2000]
+            return f"页面标题：{title}\n内容摘要：\n{text}"
     except Exception as e:
-        logger.error(f"网页抓取失败: {e}")
-        return f"抓取网页失败：{e}"
+        return f"抓取失败：{e}"
 
-# ---------- 数据处理 ----------
+# --- 数据处理 ---
 def process_data_file(path, operation, params=None):
-    if pd is None:
-        return "数据处理需要安装 pandas 和 openpyxl"
+    pd = safe_import("pandas")
+    if not pd:
+        return "请安装 pandas/openpyxl"
     if not os.path.exists(path):
         return f"文件不存在: {path}"
     try:
@@ -295,41 +402,60 @@ def process_data_file(path, operation, params=None):
             return df.head(n).to_string()
         elif operation == "columns":
             return str(list(df.columns))
+        elif operation == "tail":
+            n = int(params.get("n", 5)) if params else 5
+            return df.tail(n).to_string()
+        elif operation == "info":
+            buf = io.StringIO()
+            df.info(buf=buf)
+            return buf.getvalue()
         else:
             return f"未知操作: {operation}"
     except Exception as e:
         return f"数据处理错误：{e}"
 
-def image_caption(path):
-    if not os.path.exists(path):
-        return f"图片不存在: {path}"
-    global reader_easyocr
-    if reader_easyocr is None:
-        if easyocr:
-            reader_easyocr = easyocr.Reader(['ch_sim', 'en'])
-        else:
-            return "OCR 需要安装 easyocr"
+# --- 定时任务 ---
+def add_job(job_id, func_name, trigger_type, trigger_args, **kwargs):
     try:
-        result = reader_easyocr.readtext(path)
-        text = " ".join([item[1] for item in result])
-        return f"图片文字识别：{text if text else '(无文字)'}"
-    except Exception as e:
-        return f"OCR 错误：{e}"
-
-def text_to_speech(text, filename="tts_output.mp3"):
-    global tts_engine
-    if tts_engine is None:
-        if pyttsx3:
-            tts_engine = pyttsx3.init()
+        if trigger_type == 'cron':
+            trigger = CronTrigger(**trigger_args)
+        elif trigger_type == 'interval':
+            trigger = IntervalTrigger(**trigger_args)
         else:
-            return "TTS 需要安装 pyttsx3"
-    try:
-        tts_engine.save_to_file(text, filename)
-        tts_engine.runAndWait()
-        return f"语音已保存至 {filename}"
+            return "不支持的触发器类型"
+        # 从全局函数映射中获取函数
+        func = globals().get(func_name)
+        if not func:
+            return f"函数 {func_name} 不存在"
+        scheduler.add_job(func, trigger, id=job_id, **kwargs)
+        return f"定时任务 {job_id} 已添加"
     except Exception as e:
-        return f"TTS 错误：{e}"
+        return f"添加任务失败：{e}"
 
+def remove_job(job_id):
+    try:
+        scheduler.remove_job(job_id)
+        return f"任务 {job_id} 已移除"
+    except Exception as e:
+        return f"移除失败：{e}"
+
+def get_jobs():
+    jobs = scheduler.get_jobs()
+    res = []
+    for job in jobs:
+        res.append(f"ID: {job.id}, 下次运行: {job.next_run_time}")
+    return "\n".join(res) if res else "无定时任务"
+
+# --- 文件上传 ---
+def handle_file_upload(file):
+    if file.filename == '':
+        return None, "未选择文件"
+    filename = str(uuid.uuid4()) + "_" + file.filename
+    filepath = os.path.join(UPLOAD_FOLDER, filename)
+    file.save(filepath)
+    return filepath, None
+
+# --- 技能动态加载 ---
 def execute_skill(skill_name, params):
     skill_file = os.path.join(SKILLS_DIR, f"{skill_name}.py")
     if not os.path.exists(skill_file):
@@ -339,75 +465,82 @@ def execute_skill(skill_name, params):
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         if hasattr(module, "run"):
-            result = module.run(params)
-            return str(result)
+            return str(module.run(params))
         else:
             return f"技能 {skill_name} 缺少 run(params) 函数"
     except Exception as e:
         return f"技能执行错误：{e}"
 
+# 统一工具调度
 def execute_tool(tool_name, params):
     if tool_name == "run_command":
         return run_command(params.get("command", ""))
+    elif tool_name == "browser_navigate":
+        return browser_navigate(params.get("url", ""))
+    elif tool_name == "browser_click":
+        return browser_click(params.get("selector", ""), params.get("page_id"))
+    elif tool_name == "browser_fill":
+        return browser_fill(params.get("selector", ""), params.get("text", ""), params.get("page_id"))
+    elif tool_name == "browser_screenshot":
+        return browser_screenshot(params.get("page_id"), params.get("path"))
+    elif tool_name == "capture_camera":
+        return capture_camera(params.get("filename"))
+    elif tool_name == "image_caption":
+        return image_caption(params.get("path", ""), params.get("lang", "ch_sim+en"))
+    elif tool_name == "text_to_speech":
+        return text_to_speech(params.get("text", ""), params.get("filename"))
     elif tool_name == "search_web":
-        return search_web(params.get("query", ""), params.get("max_results", 5))
-    elif tool_name == "search_news":
-        return search_news(params.get("query", ""), params.get("max_results", 5))
-    elif tool_name == "search_images":
-        return search_images(params.get("query", ""), params.get("max_results", 5))
-    elif tool_name == "fetch_webpage":
-        return fetch_webpage(params.get("url", ""))
+        return search_web(params.get("query", ""))
+    elif tool_name == "scrape_web":
+        return scrape_web(params.get("url", ""), params.get("selector"))
     elif tool_name == "process_data":
         return process_data_file(params.get("path"), params.get("operation"), params.get("params"))
-    elif tool_name == "image_caption":
-        return image_caption(params.get("path", ""))
-    elif tool_name == "text_to_speech":
-        return text_to_speech(params.get("text", ""), params.get("filename", "tts_output.mp3"))
+    elif tool_name == "add_job":
+        return add_job(params.get("job_id"), params.get("func"), params.get("trigger_type"), params.get("trigger_args", {}))
+    elif tool_name == "remove_job":
+        return remove_job(params.get("job_id"))
+    elif tool_name == "get_jobs":
+        return get_jobs()
     elif tool_name == "run_skill":
         return execute_skill(params.get("skill"), params.get("params", {}))
     else:
         return f"未知工具: {tool_name}"
 
-# ---------- 模型加载与生成 ----------
+# ========== 模型加载与生成 ==========
 def load_model(path, device="cpu"):
     global model, model_type, model_info
     if not os.path.exists(path):
         raise FileNotFoundError(f"模型路径不存在: {path}")
     if path.lower().endswith(".gguf"):
-        try:
-            from llama_cpp import Llama
-            chat_format = None
-            if "chatml" in path.lower():
-                chat_format = "chatml"
-            elif "llama-3" in path.lower() or "llama3" in path.lower():
-                chat_format = "llama-3"
-            elif "mistral" in path.lower() or "mixtral" in path.lower():
-                chat_format = "mistral-instruct"
-            elif "qwen" in path.lower():
-                chat_format = "chatml"
-            model = Llama(
-                model_path=path,
-                n_ctx=4096,
-                n_threads=os.cpu_count(),
-                verbose=False,
-                chat_format=chat_format
-            )
-            model_type = "gguf"
-            model_info = {
-                "chat_format": chat_format,
-                "stop": model.detokenize([model.token_eos()]).decode() if hasattr(model, 'token_eos') else ["</s>"]
-            }
-            logger.info(f"GGUF 模型加载成功，chat_format={chat_format}")
-            return True
-        except ImportError:
-            raise ImportError("需要安装 llama-cpp-python")
+        from llama_cpp import Llama
+        chat_format = None
+        if "chatml" in path.lower():
+            chat_format = "chatml"
+        elif "llama-3" in path.lower() or "llama3" in path.lower():
+            chat_format = "llama-3"
+        elif "mistral" in path.lower() or "mixtral" in path.lower():
+            chat_format = "mistral-instruct"
+        elif "qwen" in path.lower():
+            chat_format = "chatml"
+        model = Llama(
+            model_path=path,
+            n_ctx=4096,
+            n_threads=os.cpu_count(),
+            verbose=False,
+            chat_format=chat_format
+        )
+        model_type = "gguf"
+        model_info = {
+            "chat_format": chat_format,
+            "stop": model.detokenize([model.token_eos()]).decode() if hasattr(model, 'token_eos') else ["</s>"]
+        }
+        logger.info(f"GGUF 模型加载成功，chat_format={chat_format}")
+        return True
     else:
-        raise ValueError("目前仅支持 .gguf 格式的模型文件")
+        raise ValueError("目前仅支持 .gguf 格式")
 
 def generate_sync(messages, max_tokens, temperature, top_p, top_k, repeat_penalty):
-    if model_type != "gguf" or model is None:
-        return "模型未正确加载"
-    try:
+    if model_type == "gguf":
         response = model.create_chat_completion(
             messages=messages,
             max_tokens=max_tokens,
@@ -415,12 +548,10 @@ def generate_sync(messages, max_tokens, temperature, top_p, top_k, repeat_penalt
             top_p=top_p,
             top_k=top_k,
             repeat_penalty=repeat_penalty,
-            stop=model_info.get("stop", ["</s>"])
+            stop=model_info.get("stop", [])
         )
         return response["choices"][0]["message"]["content"]
-    except Exception as e:
-        logger.error(f"生成失败: {e}")
-        return f"模型生成错误: {str(e)}"
+    return "模型未加载"
 
 # ========== Flask 路由 ==========
 @app.route('/')
@@ -437,20 +568,24 @@ def api_load():
     data = request.json
     path = data.get('path', '').strip()
     if not path:
-        return jsonify({'ok': False, 'error': '模型路径无效'})
+        return jsonify({'ok': False, 'error': '路径不能为空'})
     try:
         load_model(path)
-        current_config.update({k: data.get(k, current_config[k]) for k in
-                               ['temperature', 'top_p', 'top_k', 'repeat_penalty', 'max_tokens', 'enable_search']})
+        for k in ['temperature','top_p','top_k','repeat_penalty','max_tokens','enable_search']:
+            if k in data:
+                current_config[k] = data[k]
         return jsonify({'ok': True, 'message': '模型加载成功'})
     except Exception as e:
         return jsonify({'ok': False, 'error': str(e)})
 
 @app.route('/api/unload', methods=['POST'])
 def unload():
-    global model, conversation_history
+    global model, conversation_history, browser_context
     model = None
     conversation_history = []
+    if browser_context:
+        browser_context.close()
+        browser_context = None
     return jsonify({'ok': True})
 
 @app.route('/api/clear_history', methods=['POST'])
@@ -474,14 +609,17 @@ def chat():
     if not user_input:
         return jsonify({'ok': False, 'error': '输入为空'})
 
-    # 危险命令确认
+    # 处理等待中的危险命令确认
     if _pending_warning_command:
         cmd_info = _pending_warning_command
         cmd = cmd_info["command"]
         if "同意执行" in user_input:
             _pending_warning_command = None
-            res = _execute_command_safe(cmd)
-            return jsonify({'ok': True, 'reply': f"✅ 您已同意执行（后果自负）：\n```\n{cmd}\n```\n结果：\n{res}"})
+            if check_command_danger_level(cmd) == 2:
+                exec_result = "严重危险命令，二次拦截。"
+            else:
+                exec_result = _execute_command_safe(cmd)
+            return jsonify({'ok': True, 'reply': f"✅ 您已同意执行（后果自负）：\n```\n{cmd}\n```\n结果：\n{exec_result}"})
         elif "拒绝" in user_input:
             _pending_warning_command = None
             return jsonify({'ok': True, 'reply': f"❌ 已取消执行命令：\n```\n{cmd}\n```"})
@@ -490,31 +628,33 @@ def chat():
     memory_lines = load_memory()
     memory_text = "\n".join(f"- {line}" for line in memory_lines[-10:]) if memory_lines else ""
     user_pref = get_long_memory("user_preferences") or ""
-    system_content = f"{memory_text}\n{user_pref}\n" + """你是星璇，智能助手。你可以使用以下工具完成任务，输出 JSON 格式：
+    system_prompt = f"{memory_text}\n{user_pref}\n" + """你是星璇，智能助手。你可以使用以下工具完成任务，输出 JSON 格式：
 {"tool": "工具名", "params": {...}}
-可用工具：
-- search_web: 文本搜索，参数 {"query": "关键词", "max_results": 5}
-- search_news: 新闻搜索，参数 {"query": "关键词"}
-- search_images: 图片搜索，参数 {"query": "关键词"}
-- fetch_webpage: 抓取网页正文，参数 {"url": "网址"}
-- run_command: 执行系统命令，参数 {"command": "命令"}
-- process_data: 处理 Excel/CSV，参数 {"path": "文件路径", "operation": "describe/head/columns", "params": {}}
-- image_caption: 图片文字识别，参数 {"path": "图片路径"}
-- text_to_speech: 文字转语音，参数 {"text": "文本", "filename": "输出文件名"}
-- run_skill: 运行技能，参数 {"skill": "技能名", "params": {}}
+可选工具：
+- run_command: 执行命令 (params: command)
+- browser_navigate: 打开网页 (params: url) 返回页面ID
+- browser_click: 点击元素 (params: selector, page_id)
+- browser_fill: 填充输入框 (params: selector, text, page_id)
+- browser_screenshot: 截图 (params: page_id, path)
+- capture_camera: 拍照 (params: filename)
+- image_caption: 图片OCR (params: path, lang)
+- text_to_speech: 文字转语音 (params: text, filename)
+- search_web: 搜索 (params: query)
+- scrape_web: 抓取网页 (params: url, selector)
+- process_data: 处理CSV/Excel (params: path, operation, params)
+- add_job/remove_job/get_jobs: 定时任务管理
+- run_skill: 执行技能 (params: skill, params)
 如果需要调用工具，仅输出该 JSON 对象，不要附加其他文字。如果无需工具，正常自然回答。"""
 
-    messages = [{"role": "system", "content": system_content}]
+    messages = [{"role": "system", "content": system_prompt}]
     messages += conversation_history[-10:]
     messages.append({"role": "user", "content": user_input})
 
     # ReAct 循环，最多5次工具调用
-    MAX_TOOL_CALLS = 5
     final_reply = ""
     tool_call = None
     used_tool = False
-
-    for _ in range(MAX_TOOL_CALLS):
+    for _ in range(5):
         raw_output = generate_sync(messages,
                                    current_config['max_tokens'],
                                    current_config['temperature'],
@@ -528,21 +668,20 @@ def chat():
                 if "tool" in obj and "params" in obj:
                     tool_name = obj["tool"]
                     params = obj.get("params", {})
-                    # 记录助手消息
                     assistant_msg = {"role": "assistant", "content": json.dumps(obj, ensure_ascii=False)}
                     messages.append(assistant_msg)
                     conversation_history.append(assistant_msg)
-                    # 执行工具
+
                     tool_result = execute_tool(tool_name, params)
                     tool_msg = {"role": "user", "content": f"工具返回结果: {tool_result}"}
                     messages.append(tool_msg)
                     conversation_history.append(tool_msg)
+
                     tool_call = obj
                     used_tool = True
-                    continue  # 继续循环
+                    continue
             except json.JSONDecodeError:
                 pass
-        # 无工具调用，作为最终回复
         final_reply = raw_output
         break
 
@@ -555,7 +694,18 @@ def chat():
 
     return jsonify({'ok': True, 'reply': final_reply, 'tool_call': tool_call, 'used_tool': used_tool})
 
-# ---------- 记忆与配置 API ----------
+# 文件上传
+@app.route('/api/upload', methods=['POST'])
+def upload_file():
+    if 'file' not in request.files:
+        return jsonify({'ok': False, 'error': '未上传文件'})
+    file = request.files['file']
+    filepath, err = handle_file_upload(file)
+    if err:
+        return jsonify({'ok': False, 'error': err})
+    return jsonify({'ok': True, 'path': filepath})
+
+# 记忆API（同前）
 @app.route('/api/memory', methods=['GET'])
 def get_memory():
     return jsonify({'ok': True, 'memory': load_memory()})
@@ -604,8 +754,8 @@ def save_config():
             current_config[k] = data[k]
     return jsonify({'ok': True})
 
-# ---------- 前端模板 ----------
-HTML_INDEX = """
+# ========== 前端模板 ==========
+HTML_INDEX = r"""
 <!DOCTYPE html>
 <html>
 <head><meta charset="UTF-8"><title>星璇 · 智能助手</title>
@@ -627,6 +777,7 @@ body{font-family:-apple-system,sans-serif;background:#f0f4f9;height:100vh;displa
 textarea{flex:1;padding:10px;border-radius:24px;border:1px solid #cbd5e1;resize:none}
 button{padding:8px 16px;background:#3b82f6;color:white;border:none;border-radius:24px;cursor:pointer}
 .status{margin-top:12px;font-size:0.8rem}
+.file-upload{margin-top:10px}
 </style>
 <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
 </head>
@@ -634,20 +785,25 @@ button{padding:8px 16px;background:#3b82f6;color:white;border:none;border-radius
 <div class="header"><h2>✨ 星璇 · 智能助手</h2><a href="/settings" style="color:white">⚙️ 设置</a></div>
 <div class="container">
 <div class="sidebar">
-<input id="modelPath" placeholder="模型路径" style="width:100%;margin-bottom:12px" value="/path/to/model.gguf">
+<input id="modelPath" placeholder="模型路径 (GGUF)" style="width:100%;margin-bottom:12px" value="model.gguf">
 <button id="loadBtn" style="width:100%;margin-bottom:8px">🚀 加载模型</button>
 <button id="unloadBtn" style="width:100%;margin-bottom:8px">🗑️ 卸载</button>
 <button id="clearHistoryBtn" style="width:100%">🧹 清空对话</button>
+<div class="file-upload">
+  <input type="file" id="fileInput" style="display:none" multiple>
+  <button id="uploadBtn" style="width:100%">📎 上传文件</button>
+</div>
 <div id="status" class="status">未加载</div>
 </div>
 <div class="chat-main">
-<div class="chat-messages" id="messages"><div class="message assistant"><div class="bubble">你好，加载模型后即可开始。我支持文本搜索、新闻、图片、网页抓取等。</div></div></div>
+<div class="chat-messages" id="messages"><div class="message assistant"><div class="bubble">你好，加载模型后即可开始。</div></div></div>
 <div class="input-area"><textarea id="input" rows="1" placeholder="输入消息... (Enter发送)"></textarea><button id="sendBtn" disabled>发送</button></div>
 </div>
 </div>
 <script>
 let canSend=false;
 const modelPath=document.getElementById('modelPath'),loadBtn=document.getElementById('loadBtn'),unloadBtn=document.getElementById('unloadBtn'),clearBtn=document.getElementById('clearHistoryBtn'),sendBtn=document.getElementById('sendBtn'),inputBox=document.getElementById('input'),messagesDiv=document.getElementById('messages'),statusSpan=document.getElementById('status');
+const fileInput=document.getElementById('fileInput'),uploadBtn=document.getElementById('uploadBtn');
 async function refreshStatus(){const r=await fetch('/api/status'),d=await r.json();if(d.loaded){statusSpan.innerHTML='✅ 已加载';canSend=true;sendBtn.disabled=false}else{statusSpan.innerHTML='❌ 未加载';canSend=false;sendBtn.disabled=true}}
 async function loadModel(){const path=modelPath.value.trim();if(!path)return alert('请输入模型路径');const cfg={path,temperature:0.5,top_p:0.9,max_tokens:256};loadBtn.disabled=true;const r=await fetch('/api/load',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(cfg)}),d=await r.json();alert(d.ok?d.message:'加载失败:'+d.error);loadBtn.disabled=false;refreshStatus()}
 async function unloadModel(){await fetch('/api/unload',{method:'POST'});refreshStatus()}
@@ -655,13 +811,15 @@ async function clearHistory(){await fetch('/api/clear_history',{method:'POST'});
 function addMessage(role,text){const div=document.createElement('div');div.className=`message ${role}`;div.innerHTML=`<div class="bubble">${marked.parse(text)}</div>`;messagesDiv.appendChild(div);messagesDiv.scrollTop=messagesDiv.scrollHeight}
 async function sendMessage(){if(!canSend)return alert('请先加载模型');const userText=inputBox.value.trim();if(!userText)return;addMessage('user',userText);inputBox.value='';sendBtn.disabled=true;try{const r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:userText})}),d=await r.json();if(d.ok)addMessage('assistant',d.reply);else addMessage('assistant','错误:'+d.error)}catch(e){addMessage('assistant','网络错误:'+e.message)}finally{sendBtn.disabled=false}}
 inputBox.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendMessage()}});
+uploadBtn.onclick=()=>fileInput.click();
+fileInput.onchange=async()=>{for(const file of fileInput.files){const formData=new FormData();formData.append('file',file);const r=await fetch('/api/upload',{method:'POST',body:formData}),d=await r.json();addMessage('assistant',d.ok?`文件已上传：${d.path}`:'上传失败：'+d.error)}};
 loadBtn.onclick=loadModel;unloadBtn.onclick=unloadModel;clearBtn.onclick=clearHistory;sendBtn.onclick=sendMessage;refreshStatus();setInterval(refreshStatus,15000);
 </script>
 </body>
 </html>
 """
 
-HTML_SETTINGS = """
+HTML_SETTINGS = r"""
 <!DOCTYPE html>
 <html><head><meta charset="UTF-8"><title>星璇 · 设置</title>
 <style>body{font-family:sans-serif;padding:24px;background:#f0f4f9}.container{max-width:1000px;margin:auto;background:white;border-radius:16px;padding:24px}h2{margin:20px 0 12px;border-left:4px solid #3b82f6;padding-left:12px}.param-row{display:flex;align-items:center;margin-bottom:12px;gap:12px}.param-row label{width:100px}input,select{padding:6px 10px;border-radius:8px;border:1px solid #cbd5e1}button{padding:6px 12px;background:#3b82f6;color:white;border:none;border-radius:8px;cursor:pointer}.memory-list{margin-top:12px;max-height:300px;overflow:auto;border:1px solid #e2e8f0;border-radius:8px;padding:8px}.memory-item{background:#f8fafc;border-radius:8px;padding:8px;margin-bottom:8px;display:flex;justify-content:space-between}.nav{margin-bottom:20px}.nav a{color:#3b82f6;text-decoration:none}</style>
@@ -709,11 +867,5 @@ if __name__ == '__main__':
     except OSError:
         port = 8080
         print(f"端口 5000 被占用，使用 {port}")
-    print("=" * 60)
-    print("🌟 星璇 AI 助手已启动（网络搜索增强版）")
-    print(f"   首页: http://localhost:{port}")
-    print(f"   设置: http://localhost:{port}/settings")
-    print("   支持功能: 文本搜索 | 新闻搜索 | 图片搜索 | 网页抓取 | 命令执行 | 数据处理 | OCR | TTS | 技能插件")
-    print("⚠️ 危险命令已启用零容忍拦截，二级确认机制生效")
-    print("=" * 60)
-    app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
+    print("星璇安全框架已启动，危险命令分级拦截已生效。")
+    app.run(host='0.0.0.0', port=port, debug=False)
